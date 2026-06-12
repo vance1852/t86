@@ -1,0 +1,34 @@
+services:
+  db:
+    image: mysql:8.0
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: venue_booking
+      MYSQL_USER: venue
+      MYSQL_PASSWORD: venue123
+    healthcheck:
+      test:
+        ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot123"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - db_data:/var/lib/mysql
+
+  app:
+    build: .
+    environment:
+      DB_DSN: "venue:venue123@tcp(db:3306)/venue_booking?charset=utf8mb4&parseTime=True&loc=Local"
+      APP_PORT: "7653"
+      JWT_SECRET: "venue-booking-admin-dev-secret-change-me"
+      ADMIN_USERNAME: "admin"
+      ADMIN_PASSWORD: "admin123"
+    ports:
+      - "7653:7653"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db_data:
