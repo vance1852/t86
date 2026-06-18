@@ -104,14 +104,17 @@ func Run(database *gorm.DB, adminUser, adminPass string) error {
 	}
 
 	// ---------- 为其中一个预订附带器材租赁（bookings[0] 篮球馆 18-20点） ----------
+	// 注意：种子数据里我们模拟的是"已经领用完成"的场景，所以 rental 状态 = picked，并把单件置 rented
 	rentalHours := bookings[0].EndHour - bookings[0].StartHour
+	pickupTime := time.Date(2026, 6, 20, 18, 0, 0, 0, time.Local)
 	rental := models.EquipmentRental{
 		BookingID:    bookings[0].ID,
 		VenueID:      venues[0].ID,
 		TotalDeposit: float64(2)*equipments[0].Deposit + float64(4)*equipments[2].Deposit,
 		TotalRentFee: float64(2)*equipments[0].UnitPrice*float64(rentalHours) + float64(4)*equipments[2].UnitPrice*float64(rentalHours),
-		Status:       "frozen",
-		Remark:       "预订同时租赁器材",
+		Status:       "picked",
+		PickedAt:     &pickupTime,
+		Remark:       "预订同时租赁器材（种子模拟已领用场景）",
 	}
 	if err := database.Create(&rental).Error; err != nil {
 		return err

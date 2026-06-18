@@ -260,7 +260,9 @@ func (h *Handler) ListEquipmentItems(c *gin.Context) {
 		q = q.Where("status = ?", status)
 	}
 	if vid := c.Query("venue_id"); vid != "" {
-		q = q.Joins("JOIN equipments ON equipments.id = equipment_items.equipment_id").Where("equipments.venue_id = ?", vid)
+		var eqIDs []uint
+		h.DB.Model(&models.Equipment{}).Where("venue_id = ?", vid).Pluck("id", &eqIDs)
+		q = q.Where("equipment_id IN ?", eqIDs)
 	}
 	q.Find(&list)
 	c.JSON(http.StatusOK, list)

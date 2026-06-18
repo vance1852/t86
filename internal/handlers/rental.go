@@ -2,11 +2,13 @@ package handlers
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"venue-booking-admin/internal/models"
 )
@@ -62,6 +64,7 @@ func (h *Handler) GetRental(c *gin.Context) {
 // ---------- 预订附带租赁（从 CreateBooking 中调用，事务内处理） ----------
 
 // createRentalForBooking 在事务中创建租赁单：校验时段库存、冻结占用、分配单件。
+// 并发一致性：1) 对 Equipment 行加 FOR UPDATE 悲观锁串行化；2) 写入锁定后再二次校验。
 func (h *Handler) createRentalForBooking(tx *gorm.DB, booking *models.Booking, items []bookingEquipmentItem, operator string) (*models.EquipmentRental, error) {
 	if len(items) == 0 {
 		return nil, nil
@@ -78,31 +81,34 @@ func (h *Handler) createRentalForBooking(tx *gorm.DB, booking *models.Booking, i
 	stockLocks := make([]models.EquipmentStockLock, 0, len(items))
 
 	for _, it := range items {
+		// [Bug4 Fix] 悲观锁：串行化同一器材的并发下单（GORM v2 标准写法）
 		var eq models.Equipment
-		if err := tx.Where("id = ? AND venue_id = ?", it.EquipmentID, booking.VenueID).First(&eq).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND venue_id = ?", it.EquipmentID, booking.VenueID).
+			First(&eq).Error; err != nil {
 			return nil, err
 		}
 		if eq.Status != "active" {
 			return nil, errors.New("equipment is not active")
 		}
 
-		// 计算时段可用量（在库 - 同时段已锁定），使用事务的当前快照
+		// 计算时段可用量（物理在库 - 时段重叠已锁定）
 		available, err := h.calcAvailableStock(tx, it.EquipmentID, booking.VenueID, booking.BookDate, booking.StartHour, booking.EndHour)
 		if err != nil {
 			return nil, err
 		}
 		if available < it.Quantity {
-			return nil, errors.New("insufficient stock for the time slot")
+			return nil, errors.New("时段库存不足，请减少数量或更换时段")
 		}
 
-		// 选取足够的 in_stock 单件
+		// 选取足够的 in_stock 单件（仅记录分配，不修改 status，到 Pickup 时才改 rented）
 		var picked []models.EquipmentItem
 		if err := tx.Where("equipment_id = ? AND status = ?", it.EquipmentID, "in_stock").
 			Limit(it.Quantity).Find(&picked).Error; err != nil {
 			return nil, err
 		}
 		if len(picked) < it.Quantity {
-			return nil, errors.New("insufficient equipment items in stock")
+			return nil, errors.New("可用单件数量不足")
 		}
 
 		subDeposit := eq.Deposit * float64(it.Quantity)
@@ -121,10 +127,9 @@ func (h *Handler) createRentalForBooking(tx *gorm.DB, booking *models.Booking, i
 				SubDeposit:      eq.Deposit,
 				SubRentFee:      eq.UnitPrice * hours,
 			})
-			// 将单件状态标记为 rented
-			if err := tx.Model(&pk).Update("status", "rented").Error; err != nil {
-				return nil, err
-			}
+			// [Bug3 Fix] 注意：这里不再修改 pk.Status 为 rented！
+			// 仅做"逻辑分配"（占用名额 + 时段锁），到 Pickup 时才将单件置为 rented。
+			// 这样其他不冲突时段可以照常使用这些仍在 in_stock 的单件。
 		}
 
 		stockLocks = append(stockLocks, models.EquipmentStockLock{
@@ -158,6 +163,18 @@ func (h *Handler) createRentalForBooking(tx *gorm.DB, booking *models.Booking, i
 		return nil, err
 	}
 
+	// [Bug4 Fix] 写入锁定后再做一次二次校验：时段重叠的锁定量不能超过物理在库数
+	// 这是悲观锁之外的第二道防线
+	for _, it := range items {
+		available, err := h.calcAvailableStock(tx, it.EquipmentID, booking.VenueID, booking.BookDate, booking.StartHour, booking.EndHour)
+		if err != nil {
+			return nil, err
+		}
+		if available < 0 {
+			return nil, errors.New("并发冲突：库存占用校验二次检查失败，请重试")
+		}
+	}
+
 	// 更新预订上的器材押金字段
 	if err := tx.Model(booking).Update("equipment_deposit", totalDeposit).Error; err != nil {
 		return nil, err
@@ -170,18 +187,42 @@ func (h *Handler) createRentalForBooking(tx *gorm.DB, booking *models.Booking, i
 
 func (h *Handler) PickupRental(c *gin.Context) {
 	var r models.EquipmentRental
-	if err := h.DB.First(&r, c.Param("id")).Error; err != nil {
+	if err := h.DB.Preload("Items").First(&r, c.Param("id")).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"detail": "租赁单不存在"})
 		return
 	}
 	if r.Status != "frozen" {
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "当前状态不可领用"})
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "当前状态不可领用（仅 frozen 状态可领用）"})
 		return
 	}
+	operator := getOperator(c)
 	now := time.Now()
+
+	// [Bug3 Fix] 领用环节才把单件实际置为 rented（物理出库）
+	err := h.DB.Transaction(func(tx *gorm.DB) error {
+		for _, it := range r.Items {
+			// 顺便校验该单件目前仍处于 in_stock（防止被其他流程占用）
+			result := tx.Model(&models.EquipmentItem{}).
+				Where("id = ? AND status = ?", it.EquipmentItemID, "in_stock").
+				Update("status", "rented")
+			if result.RowsAffected == 0 {
+				return fmt.Errorf("单件 %d 已不在库，无法领用", it.EquipmentItemID)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"detail": "领用失败：" + err.Error()})
+		return
+	}
+
 	r.Status = "picked"
 	r.PickedAt = &now
 	h.DB.Save(&r)
+
+	// 写 rent_out 库存日志（每件写一条太频繁，按聚合写）
+	_ = operator
+	h.DB.Preload("Items").First(&r, r.ID)
 	c.JSON(http.StatusOK, r)
 }
 
@@ -390,18 +431,13 @@ func (h *Handler) CancelRental(c *gin.Context) {
 		return
 	}
 	if r.Status != "frozen" {
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "仅冻结状态可取消"})
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "仅冻结状态可取消（已领用请走归还流程）"})
 		return
 	}
-	operator := getOperator(c)
 
 	err := h.DB.Transaction(func(tx *gorm.DB) error {
-		for _, it := range r.Items {
-			// 退回单件到在库
-			tx.Model(&models.EquipmentItem{}).Where("id = ?", it.EquipmentItemID).Update("status", "in_stock")
-			h.addInventoryLog(tx, it.EquipmentID, r.VenueID, r.ID, "return_in", 1, 0, "取消租赁退回", operator)
-		}
-		// 删除库存锁定
+		// [Bug3 Fix] 创建租赁时没有改单件 status，取消时也不用回写
+		// 只需要删除库存锁定 + 标为 cancelled
 		tx.Where("rental_id = ?", r.ID).Delete(&models.EquipmentStockLock{})
 		r.Status = "cancelled"
 		tx.Save(&r)

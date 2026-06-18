@@ -66,27 +66,26 @@ func (h *Handler) CreateTransfer(c *gin.Context) {
 		}
 
 		for _, it := range req.Items {
-			// 校验调出馆有足够的在库数量
-			var inStock int64
-			tx.Model(&models.EquipmentItem{}).
-				Joins("JOIN equipments ON equipments.id = equipment_items.equipment_id").
-				Where("equipment_items.equipment_id = ? AND equipments.venue_id = ? AND equipment_items.status = ?",
-					it.EquipmentID, req.FromVenueID, "in_stock").Count(&inStock)
-			if int(inStock) < it.Quantity {
-				return errors.New("insufficient stock in source venue")
+			// 0) 先校验 equipment_id 确实归属调出场馆（之后查 Item 就不需要 JOIN，避免 GORM JOIN 踩坑）
+			var srcEq models.Equipment
+			if err := tx.Where("id = ? AND venue_id = ?", it.EquipmentID, req.FromVenueID).First(&srcEq).Error; err != nil {
+				return errors.New("该器材不属于调出场馆，请确认 equipment_id 与 from_venue_id 匹配")
 			}
 
-			// 选取并标记为"在途"（用状态 rented 不太对，此处借用 repairing 作为临时在途状态；
-			// 更规范做法：但状态机有限，我们改为先将这些单件从 from 的 venue 库存里扣减，
-			// 实际入库时再在 to 的 venue 生成器材记录或直接把单件移过去。
-			// 简化实现：先把单件状态改成 rented 视为锁定，完成调拨时迁移 venue。）
+			// 1) 校验调出馆有足够的在库数量
+			var inStock int64
+			tx.Model(&models.EquipmentItem{}).
+				Where("equipment_id = ? AND status = ?", it.EquipmentID, "in_stock").Count(&inStock)
+			if int(inStock) < it.Quantity {
+				return errors.New("调出馆库存不足")
+			}
+
+			// 2) 选取对应数量的在库单件，标记为"在途"（借用 repairing 表示"调拨在途"）
 			var pickedItems []models.EquipmentItem
-			tx.Joins("JOIN equipments ON equipments.id = equipment_items.equipment_id").
-				Where("equipment_items.equipment_id = ? AND equipments.venue_id = ? AND equipment_items.status = ?",
-					it.EquipmentID, req.FromVenueID, "in_stock").
+			tx.Where("equipment_id = ? AND status = ?", it.EquipmentID, "in_stock").
 				Limit(it.Quantity).Find(&pickedItems)
 			for _, pi := range pickedItems {
-				tx.Model(&pi).Update("status", "repairing") // 借用 repairing 表示"调拨在途"
+				tx.Model(&pi).Update("status", "repairing")
 			}
 
 			tx.Create(&models.EquipmentTransferItem{
@@ -123,24 +122,23 @@ func (h *Handler) CompleteTransfer(c *gin.Context) {
 
 	err := h.DB.Transaction(func(tx *gorm.DB) error {
 		for _, it := range transfer.Items {
-			// 1) 先从调出馆找到对应数量的"在途"单件
+			// 0) 先拿到源聚合器材，也顺便校验归属
+			var srcEq models.Equipment
+			if err := tx.Where("id = ? AND venue_id = ?", it.EquipmentID, transfer.FromVenueID).First(&srcEq).Error; err != nil {
+				return errors.New("源器材不存在或不属于调出场馆")
+			}
+
+			// 1) 找到对应数量的"在途"单件（repairing = 在途）
 			var inTransitItems []models.EquipmentItem
-			tx.Joins("JOIN equipments ON equipments.id = equipment_items.equipment_id").
-				Where("equipment_items.equipment_id = ? AND equipments.venue_id = ? AND equipment_items.status = ?",
-					it.EquipmentID, transfer.FromVenueID, "repairing").
+			tx.Where("equipment_id = ? AND status = ?", it.EquipmentID, "repairing").
 				Limit(it.Quantity).Find(&inTransitItems)
 
-			// 2) 看目标场馆是否已有该器材（按 category + name 聚合判断，简化：直接查找同 name+to_venue）
+			// 2) 看目标场馆是否已有同名同类别的聚合器材（category_id + name + venue_id 唯一匹配）
 			var targetEq models.Equipment
-			err := tx.Where("venue_id = ? AND name = ?", transfer.ToVenueID, "").
-				Joins("JOIN equipments src ON src.id = ?", it.EquipmentID).
-				First(&targetEq).Error
+			err := tx.Where("venue_id = ? AND category_id = ? AND name = ?",
+				transfer.ToVenueID, srcEq.CategoryID, srcEq.Name).First(&targetEq).Error
 			if err != nil {
 				// 不存在则克隆一条器材记录到目标场馆
-				var srcEq models.Equipment
-				if err := tx.First(&srcEq, it.EquipmentID).Error; err != nil {
-					return err
-				}
 				targetEq = models.Equipment{
 					CategoryID:   srcEq.CategoryID,
 					VenueID:      transfer.ToVenueID,
@@ -166,12 +164,10 @@ func (h *Handler) CompleteTransfer(c *gin.Context) {
 			// 4) 更新目标聚合的 total_stock
 			tx.Model(&targetEq).Update("total_stock", gorm.Expr("total_stock + ?", it.Quantity))
 			// 5) 源聚合 total_stock 扣减
-			tx.Model(&models.Equipment{}).Where("id = ?", it.EquipmentID).Update("total_stock", gorm.Expr("total_stock - ?", it.Quantity))
+			tx.Model(&srcEq).Update("total_stock", gorm.Expr("total_stock - ?", it.Quantity))
 
-			// 6) 调入馆库存日志
-			var targetInStock int64
-			tx.Model(&models.EquipmentItem{}).Where("equipment_id = ? AND status = ?", targetEq.ID, "in_stock").Count(&targetInStock)
-			h.addInventoryLog(tx, targetEq.ID, transfer.ToVenueID, transfer.ID, "transfer_in", it.Quantity, int(targetInStock), "调拨入库", operator)
+			// 6) 调入馆库存日志（先扣减后查，但这里直接用入库数量计算）
+			h.addInventoryLog(tx, targetEq.ID, transfer.ToVenueID, transfer.ID, "transfer_in", it.Quantity, int(targetEq.TotalStock-it.Quantity), "调拨入库", operator)
 		}
 
 		transfer.Status = "completed"
@@ -200,18 +196,21 @@ func (h *Handler) CancelTransfer(c *gin.Context) {
 
 	h.DB.Transaction(func(tx *gorm.DB) error {
 		for _, it := range transfer.Items {
-			tx.Model(&models.EquipmentItem{}).
-				Joins("JOIN equipments ON equipments.id = equipment_items.equipment_id").
-				Where("equipment_items.equipment_id = ? AND equipments.venue_id = ? AND equipment_items.status = ?",
-					it.EquipmentID, transfer.FromVenueID, "repairing").
+			// 先校验源归属
+			var srcEq models.Equipment
+			if err := tx.Where("id = ? AND venue_id = ?", it.EquipmentID, transfer.FromVenueID).First(&srcEq).Error; err != nil {
+				continue
+			}
+			// 把在途（repairing）的单件改回在库
+			result := tx.Model(&models.EquipmentItem{}).
+				Where("equipment_id = ? AND status = ?", it.EquipmentID, "repairing").
 				Limit(it.Quantity).
 				Update("status", "in_stock")
+			_ = result
 
 			var inStockAfter int64
 			tx.Model(&models.EquipmentItem{}).
-				Joins("JOIN equipments ON equipments.id = equipment_items.equipment_id").
-				Where("equipment_items.equipment_id = ? AND equipments.venue_id = ? AND equipment_items.status = ?",
-					it.EquipmentID, transfer.FromVenueID, "in_stock").Count(&inStockAfter)
+				Where("equipment_id = ? AND status = ?", it.EquipmentID, "in_stock").Count(&inStockAfter)
 			h.addInventoryLog(tx, it.EquipmentID, transfer.FromVenueID, transfer.ID, "transfer_in", it.Quantity, int(inStockAfter), "调拨取消回库", operator)
 		}
 		transfer.Status = "cancelled"
